@@ -20,12 +20,13 @@
 
 mod dns;
 mod query;
-
 use self::dns::{build_query, build_query_response, build_service_discovery_response};
 use self::query::MdnsPacket;
 use crate::behaviour::{socket::AsyncSocket, timer::Builder};
 use crate::Config;
 use futures::channel::mpsc;
+use futures::future::Ready;
+use futures::stream::Pending;
 use futures::{SinkExt, StreamExt};
 use libp2p_core::Multiaddr;
 use libp2p_identity::PeerId;
@@ -43,7 +44,7 @@ use std::{
 };
 
 /// Initial interval for starting probe
-const INITIAL_TIMEOUT_INTERVAL: Duration = Duration::from_millis(500);
+const INITIAL_TIMEOUT_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 enum ProbeState {
@@ -102,6 +103,7 @@ pub(crate) struct InterfaceState<U, T> {
     ttl: Duration,
     probe_state: ProbeState,
     local_peer_id: PeerId,
+    address_watch_receiver: async_broadcast::Receiver<Multiaddr>,
 }
 
 impl<U, T> InterfaceState<U, T>
@@ -116,6 +118,7 @@ where
         local_peer_id: PeerId,
         listen_addresses: Arc<RwLock<ListenAddresses>>,
         query_response_sender: mpsc::Sender<(PeerId, Multiaddr, Instant)>,
+        listen_watch_receiver: async_broadcast::Receiver<Multiaddr>,
     ) -> io::Result<Self> {
         tracing::info!(address=%addr, "creating instance on iface address");
         let recv_socket = match addr {
@@ -179,7 +182,8 @@ where
             multicast_addr,
             ttl: config.ttl,
             probe_state: Default::default(),
-            local_peer_id,
+            local_peer_id: local_peer_id,
+            address_watch_receiver: listen_watch_receiver,
         })
     }
 
@@ -187,6 +191,11 @@ where
         tracing::trace!(address=%self.addr, probe_state=?self.probe_state, "reset timer");
         let interval = *self.probe_state.interval();
         self.timeout = T::interval(interval);
+    }
+
+    pub(crate) fn reset_timer_to_now(&mut self) {
+        tracing::trace!(address=%self.addr, probe_state=?self.probe_state, "reset timer to now");
+        self.timeout = T::interval_at(Instant::now(), INITIAL_TIMEOUT_INTERVAL);
     }
 
     fn mdns_socket(&self) -> SocketAddr {
@@ -205,6 +214,26 @@ where
         let this = self.get_mut();
 
         loop {
+            match this.address_watch_receiver.poll_next_unpin(cx) {
+                Poll::Ready(ready) => match ready {
+                    Some(addr) => {
+                        tracing::debug!(address=%this.addr, new_multiaddr_listen=%addr, "new listen addr added");
+                        tracing::debug!(address=%this.addr,  new_multiaddr_listen=%addr, "start discover cause new address added when current state is finished");
+                        this.probe_state = ProbeState::default();
+                        this.reset_timer_to_now();
+                        //if let ProbeState::Finished(_) = this.probe_state {
+                        //    if !this.timeout.poll_next_unpin(cx).is_ready() {
+                        //      TODO: remove or improve
+                        //      this code part makes solution less stable
+                        //    }
+                        //}
+                    }
+                    None => {
+                        // closed?
+                    }
+                },
+                Poll::Pending => {}
+            }
             // 1st priority: Low latency: Create packet ASAP after timeout.
             if this.timeout.poll_next_unpin(cx).is_ready() {
                 tracing::trace!(address=%this.addr, "sending query on iface");

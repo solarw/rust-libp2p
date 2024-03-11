@@ -21,10 +21,10 @@
 mod iface;
 mod socket;
 mod timer;
-
 use self::iface::InterfaceState;
 use crate::behaviour::{socket::AsyncSocket, timer::Builder};
 use crate::Config;
+use async_broadcast::{broadcast, TryRecvError};
 use futures::channel::mpsc;
 use futures::{Stream, StreamExt};
 use if_watch::IfEvent;
@@ -32,15 +32,14 @@ use libp2p_core::{Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::behaviour::FromSwarm;
 use libp2p_swarm::{
-    dummy, ConnectionDenied, ConnectionId, ListenAddresses, NetworkBehaviour, THandler,
-    THandlerInEvent, THandlerOutEvent, ToSwarm,
+    dummy, ConnectionDenied, ConnectionId, ListenAddresses, NetworkBehaviour, NewListenAddr,
+    THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use smallvec::SmallVec;
 use std::collections::hash_map::{Entry, HashMap};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::{cmp, fmt, io, net::IpAddr, pin::Pin, task::Context, task::Poll, time::Instant};
-
 /// An abstraction to allow for compatibility with various async runtimes.
 pub trait Provider: 'static {
     /// The Async Socket type.
@@ -57,7 +56,6 @@ pub trait Provider: 'static {
 
     fn spawn(task: impl Future<Output = ()> + Send + 'static) -> Self::TaskHandle;
 }
-
 #[allow(unreachable_pub)] // Not re-exported.
 pub trait Abort {
     fn abort(self);
@@ -106,6 +104,7 @@ pub mod tokio {
     use crate::behaviour::{socket::tokio::TokioUdpSocket, timer::tokio::TokioTimer, Abort};
     use if_watch::tokio::IfWatcher;
     use std::future::Future;
+    pub use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
     #[doc(hidden)]
@@ -134,7 +133,6 @@ pub mod tokio {
 
     pub type Behaviour = super::Behaviour<Tokio>;
 }
-
 /// A `NetworkBehaviour` for mDNS. Automatically discovers peers on the local network and adds
 /// them to the topology.
 #[derive(Debug)]
@@ -172,8 +170,8 @@ where
     listen_addresses: Arc<RwLock<ListenAddresses>>,
 
     local_peer_id: PeerId,
+    listen_address_watch: (async_broadcast::Sender<Multiaddr>, async_broadcast::Receiver<Multiaddr>),
 }
-
 impl<P> Behaviour<P>
 where
     P: Provider,
@@ -191,7 +189,8 @@ where
             discovered_nodes: Default::default(),
             closest_expiration: Default::default(),
             listen_addresses: Default::default(),
-            local_peer_id,
+            local_peer_id: local_peer_id,
+            listen_address_watch: broadcast(1000),
         })
     }
 
@@ -280,6 +279,17 @@ where
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .on_swarm_event(&event);
+
+        match event {
+            FromSwarm::NewListenAddr(NewListenAddr { addr, .. }) => {
+                self.listen_address_watch
+                    .0
+                    .try_broadcast(addr.clone())
+                    .unwrap_or_default();
+            }
+            _ => (),
+        };
+        ()
     }
 
     #[tracing::instrument(level = "trace", name = "NetworkBehaviour::poll", skip(self, cx))]
@@ -292,7 +302,7 @@ where
             match event {
                 Ok(IfEvent::Up(inet)) => {
                     let addr = inet.addr();
-                    if addr.is_loopback() {
+                    if !addr.is_loopback() {
                         continue;
                     }
                     if addr.is_ipv4() && self.config.enable_ipv6
@@ -307,6 +317,7 @@ where
                             self.local_peer_id,
                             self.listen_addresses.clone(),
                             self.query_response_sender.clone(),
+                            self.listen_address_watch.1.clone(),
                         ) {
                             Ok(iface_state) => {
                                 e.insert(P::spawn(iface_state));
